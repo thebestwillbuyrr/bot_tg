@@ -6,35 +6,35 @@ from contextlib import closing
 from typing import Iterable
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandObject
-from aiogram.types import Message
 from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ChatMemberStatus, ParseMode
+from aiogram.filters import Command, CommandObject
+from aiogram.types import ChatMemberUpdated, Message
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 
 # =========================
 # НАСТРОЙКИ БОТА
 # =========================
 
-# Загружаем переменные окружения из файла .env, если он есть рядом с проектом.
 load_dotenv()
 
-# Токен бота, который выдаёт BotFather.
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-
-# Список Telegram user_id администраторов, которым разрешены команды рассылки.
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {
     int(x.strip())
     for x in os.getenv("ADMIN_IDS", "").split(",")
     if x.strip().isdigit()
 }
+DB_PATH = os.getenv("DB_PATH", "bot.db").strip()
 
-# Путь к локальной базе SQLite. По умолчанию файл создастся рядом со скриптом.
-DB_PATH = os.getenv("DB_PATH", "bot.db")
+# Текст автоматической рассылки.
+AUTO_MESSAGE = os.getenv(
+    "AUTO_MESSAGE",
+    "Кому нужна работа на стройке? Пишите в личку."
+).replace("\\n", "\n").strip()
 
-# Без токена бот не сможет подключиться к Telegram API.
 if not BOT_TOKEN:
-    raise RuntimeError("Укажи BOT_TOKEN в файле .env")
+    raise RuntimeError("Укажи BOT_TOKEN в файле .env или в переменных окружения")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,10 +47,11 @@ bot = Bot(
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
 dp = Dispatcher()
+scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
 
 
 # =========================
-# РАБОТА С БАЗОЙ ДАННЫХ SQLITE
+# РАБОТА С БАЗОЙ SQLITE
 # =========================
 def init_db() -> None:
     with closing(sqlite3.connect(DB_PATH)) as conn:
@@ -121,12 +122,20 @@ def is_admin(user_id: int) -> bool:
 async def safe_send(chat_id: int, text: str) -> tuple[bool, str]:
     try:
         await bot.send_message(chat_id=chat_id, text=text)
-        await asyncio.sleep(0.08)  # Небольшая пауза, чтобы не упираться в лимиты Telegram слишком резко
+        await asyncio.sleep(0.08)
         return True, "ok"
     except Exception as e:
         err = str(e)
-        if "bot was kicked" in err.lower() or "chat not found" in err.lower() or "forbidden" in err.lower():
+        err_lower = err.lower()
+
+        if (
+            "bot was kicked" in err_lower
+            or "chat not found" in err_lower
+            or "forbidden" in err_lower
+            or "have no rights" in err_lower
+        ):
             deactivate_chat(chat_id)
+
         logger.warning("Не удалось отправить в %s: %s", chat_id, err)
         return False, err
 
@@ -134,12 +143,14 @@ async def safe_send(chat_id: int, text: str) -> tuple[bool, str]:
 async def broadcast(text: str, chat_ids: Iterable[int]) -> tuple[int, int]:
     ok_count = 0
     fail_count = 0
+
     for chat_id in chat_ids:
         ok, _ = await safe_send(chat_id, text)
         if ok:
             ok_count += 1
         else:
             fail_count += 1
+
     return ok_count, fail_count
 
 
@@ -156,8 +167,54 @@ def format_chats() -> str:
     return "\n".join(lines)
 
 
+async def auto_broadcast_job() -> None:
+    chat_ids = get_active_chat_ids()
+    if not chat_ids:
+        logger.info("Авторассылка пропущена: нет активных чатов")
+        return
+
+    ok_count, fail_count = await broadcast(AUTO_MESSAGE, chat_ids)
+    logger.info(
+        "Авторассылка завершена. Успешно: %s, ошибок: %s",
+        ok_count,
+        fail_count,
+    )
+
+
+def setup_scheduler() -> None:
+    # Каждый день в 07:00
+    scheduler.add_job(
+        auto_broadcast_job,
+        trigger="cron",
+        hour=7,
+        minute=0,
+        id="daily_morning_broadcast",
+        replace_existing=True,
+    )
+
+    # Каждый день в 18:00
+    scheduler.add_job(
+        auto_broadcast_job,
+        trigger="cron",
+        hour=18,
+        minute=0,
+        id="daily_evening_broadcast",
+        replace_existing=True,
+    )
+
+    # Каждый день в 23:00
+    scheduler.add_job(
+        auto_broadcast_job,
+        trigger="cron",
+        hour=23,
+        minute=0,
+        id="daily_night_broadcast",
+        replace_existing=True,
+    )
+
+
 # =========================
-# ПРОВЕРКА, ЧТО КОМАНДУ ВЫЗВАЛ АДМИНИСТРАТОР
+# ПРОВЕРКА ДОСТУПА
 # =========================
 async def deny_if_not_admin(message: Message) -> bool:
     user = message.from_user
@@ -168,27 +225,57 @@ async def deny_if_not_admin(message: Message) -> bool:
 
 
 # =========================
-# КОМАНДЫ ДЛЯ ПОЛЬЗОВАТЕЛЕЙ И ГРУПП
+# СОБЫТИЯ ГРУПП
+# =========================
+@dp.my_chat_member()
+async def on_bot_added_to_chat(event: ChatMemberUpdated) -> None:
+    # Когда бота добавили в группу или дали права, сохраняем чат автоматически.
+    chat = event.chat
+    new_status = event.new_chat_member.status
+
+    if new_status in {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR}:
+        upsert_chat(chat.id, chat.title, chat.type)
+        logger.info("Бот добавлен в чат: %s (%s)", chat.title, chat.id)
+
+    # Если бота удалили или выгнали, помечаем чат как неактивный.
+    if new_status in {ChatMemberStatus.LEFT, ChatMemberStatus.KICKED}:
+        deactivate_chat(chat.id)
+        logger.info("Бот удалён из чата: %s (%s)", chat.title, chat.id)
+
+
+@dp.message(F.chat.type.in_({"group", "supergroup"}))
+async def auto_register_groups(message: Message) -> None:
+    # Любое сообщение в группе обновляет информацию о чате в базе.
+    chat = message.chat
+    upsert_chat(chat.id, chat.title, chat.type)
+
+
+# =========================
+# КОМАНДЫ
 # =========================
 @dp.message(Command("start"))
 async def cmd_start(message: Message) -> None:
     chat = message.chat
     upsert_chat(chat.id, chat.title, chat.type)
 
+    if chat.type in {"group", "supergroup"}:
+        await message.answer("Бот подключён и запомнил этот чат.")
+        return
+
     await message.answer(
         "Бот активен.\n\n"
-        "Чтобы бот мог делать рассылку в беседу, добавь его в нужную группу и выдай право отправки сообщений.\n"
-        "Затем в этой группе отправь /register"
+        "Добавь бота в нужные группы и дай ему право писать сообщения.\n"
+        "Он сам запомнит группы без команды /register.\n\n"
+        "Авторассылка настроена на 07:00, 18:00 и 23:00."
     )
 
 
 @dp.message(Command("register"))
 async def cmd_register(message: Message) -> None:
+    # Оставляем как запасной вариант.
     chat = message.chat
     upsert_chat(chat.id, chat.title, chat.type)
-    await message.answer(
-        f"Чат зарегистрирован для рассылки.\nID: <code>{chat.id}</code>"
-    )
+    await message.answer(f"Чат сохранён.\nID: <code>{chat.id}</code>")
 
 
 @dp.message(Command("unregister"))
@@ -197,9 +284,6 @@ async def cmd_unregister(message: Message) -> None:
     await message.answer("Этот чат отключён от рассылки.")
 
 
-# =========================
-# КОМАНДЫ АДМИНИСТРАТОРА
-# =========================
 @dp.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     if await deny_if_not_admin(message):
@@ -210,10 +294,12 @@ async def cmd_help(message: Message) -> None:
         "/chats — список чатов\n"
         "/broadcast ТЕКСТ — отправить во все активные чаты\n"
         "/broadcast_to CHAT_ID ТЕКСТ — отправить в один чат\n"
+        "/settext ТЕКСТ — изменить текст авторассылки до следующего перезапуска\n"
         "/myid — показать твой user_id\n\n"
-        "<b>Команды для групп</b>\n"
-        "/register — включить чат в рассылку\n"
-        "/unregister — выключить чат из рассылки"
+        "<b>Для групп</b>\n"
+        "Достаточно просто добавить бота в группу и дать право писать.\n"
+        "/register можно не использовать.\n"
+        "/unregister — выключить группу из рассылки"
     )
 
 
@@ -249,9 +335,7 @@ async def cmd_broadcast(message: Message, command: CommandObject) -> None:
 
     await message.answer(f"Запускаю рассылку по {len(chat_ids)} чатам...")
     ok_count, fail_count = await broadcast(text, chat_ids)
-    await message.answer(
-        f"Готово. Успешно: {ok_count}, ошибок: {fail_count}."
-    )
+    await message.answer(f"Готово. Успешно: {ok_count}, ошибок: {fail_count}.")
 
 
 @dp.message(Command("broadcast_to"))
@@ -283,19 +367,33 @@ async def cmd_broadcast_to(message: Message, command: CommandObject) -> None:
         await message.answer(f"Ошибка отправки: <code>{err}</code>")
 
 
-@dp.message(F.chat.type.in_({"group", "supergroup"}))
-async def auto_register_groups(message: Message) -> None:
-    # Любое сообщение в группе обновляет информацию о чате в базе данных.
-    chat = message.chat
-    upsert_chat(chat.id, chat.title, chat.type)
+@dp.message(Command("settext"))
+async def cmd_settext(message: Message, command: CommandObject) -> None:
+    global AUTO_MESSAGE
+
+    if await deny_if_not_admin(message):
+        return
+
+    text = (command.args or "").strip()
+    if not text:
+        await message.answer("Использование: /settext ТЕКСТ")
+        return
+
+    AUTO_MESSAGE = text
+    await message.answer(
+        "Текст авторассылки обновлён до следующего перезапуска приложения."
+    )
 
 
 async def main() -> None:
-    # Создаём таблицы при старте приложения.
     init_db()
+    setup_scheduler()
+    scheduler.start()
+
     logger.info("Бот запущен")
-    # Запускаем long polling: бот сам регулярно спрашивает Telegram,
-    # не пришли ли новые сообщения и команды.
+    logger.info("Авторассылка активна: 07:00, 18:00, 23:00")
+    logger.info("Текущий текст авторассылки: %s", AUTO_MESSAGE)
+
     await dp.start_polling(bot)
 
 
