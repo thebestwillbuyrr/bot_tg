@@ -338,6 +338,21 @@ async def cmd_broadcast(message: Message, command: CommandObject) -> None:
     await message.answer(f"Готово. Успешно: {ok_count}, ошибок: {fail_count}.")
 
 
+
+@dp.message(Command("sendauto"))
+async def cmd_sendauto(message: Message) -> None:
+    if await deny_if_not_admin(message):
+        return
+
+    chat_ids = get_active_chat_ids()
+    if not chat_ids:
+        await message.answer("Нет активных чатов для рассылки.")
+        return
+
+    await message.answer(f"Отправляю текущий AUTO_MESSAGE по {len(chat_ids)} чатам...")
+    ok_count, fail_count = await broadcast(AUTO_MESSAGE, chat_ids)
+    await message.answer(f"Готово. Успешно: {ok_count}, ошибок: {fail_count}.")
+
 @dp.message(Command("broadcast_to"))
 async def cmd_broadcast_to(message: Message, command: CommandObject) -> None:
     if await deny_if_not_admin(message):
